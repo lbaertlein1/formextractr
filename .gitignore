@@ -1,0 +1,13 @@
+# Never commit real secrets
+.env
+
+# R session/project cruft
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Local template data — remove these two lines if you *want* templates
+# and images tracked in git (e.g. to share them across a team via repo)
+data/templates/
+data/template_images/
