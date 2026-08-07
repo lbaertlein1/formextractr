@@ -74,21 +74,17 @@ EXTRACTION_TEMPERATURE <- 0
 # low-res for reliable reading otherwise.
 EXTRACTION_MIN_CROP_DIM <- 150
 
-# Deskew threshold (%) passed to ImageMagick's -deskew operator via
-# magick::image_deskew(). NOTE: disabled by default — see
-# EXTRACTION_DESKEW_ENABLED below. Left here in case it's re-enabled.
-EXTRACTION_DESKEW_THRESHOLD <- 40
-
-# Deskew was found to over-rotate in practice (sometimes badly) rather
-# than correct genuine scan skew, and corrupted everything downstream
-# of it when it did. It's also structurally redundant now: with 4
-# reference points, alignment does a full perspective warp, which
-# handles rotation as part of that general correction anyway — a
-# separate blind pre-rotation step adds a failure mode without adding
-# a capability reference-point alignment doesn't already have. Default
-# OFF; flip to TRUE only if a specific form genuinely needs it and
-# reference-point/border alignment alone isn't enough.
-EXTRACTION_DESKEW_ENABLED <- FALSE
+# No separate deskew/rotation-correction step. Removed entirely (not
+# just left off) — it was found to over-rotate in practice and corrupt
+# everything downstream when it did, and rotation is fully handled by
+# reference-point alignment's own perspective warp anyway (2-4 points
+# already correct rotation as one degree of freedom within that general
+# transform). A blind pre-rotation pass added a failure mode without
+# adding any capability reference-point alignment doesn't already have.
+# All geometric correction now goes through reference points (primary)
+# or border detection (fallback, position/scale only — see
+# fit_border_transform() in utils_extraction.R) — nothing corrects skew
+# independently of those.
 
 # Border-alignment (reference-point) detection. Most tally-sheet-style
 # forms have a strong printed black rectangle framing the whole table —
@@ -130,3 +126,31 @@ EXTRACTION_REF_MIN_SCORE <- 0.5  # threshold on the confidence-derived pseudo-sc
 EXTRACTION_REF_API_MAX_DIM <- 1568  # px — submission is downscaled to at most this on its longer side before
                                      # the locate-text API call; controls cost/latency without hurting precision,
                                      # since the result is a resolution-independent fraction of the image either way
+
+# Grid overlay for locate_reference_points_holistic()'s "Auto-suggest
+# via AI" — asking a vision model for a precise continuous fraction
+# proved unreliable in practice (confirmed: format got fixed, accuracy
+# didn't). Asking "which labeled cell" is a coarser but far more
+# reliable question. 10x14 gives ~10% x ~7% precision per cell — coarse
+# on purpose; the placement panel's drag-to-correct refines from there,
+# it isn't meant to be bypassed by a precise enough AI guess.
+EXTRACTION_REF_GRID_COLS <- 10
+EXTRACTION_REF_GRID_ROWS <- 14
+
+# Pass 2 (refine): after the coarse whole-page grid pass above gives a
+# rough cell, crop a small window around that guess from the FULL-
+# RESOLUTION submission (not downscaled), draw a FINER grid just on
+# that crop, and ask again. Smaller search range + more actual pixel
+# detail = meaningfully better precision than the coarse pass alone —
+# same coarse-then-refine principle that worked for the earlier pixel-
+# matching approach, re-applied at the API-call level instead.
+# WINDOW_FRAC: the refine crop covers this fraction of the full page's
+# width/height, centered on the coarse guess (or the geometric default,
+# if the coarse guess wasn't confident — see locate_reference_points_two_pass()).
+# GRID_COLS/ROWS: finer grid drawn on that crop. Effective final
+# precision ≈ (WINDOW_FRAC / GRID_COLS) of the page width, and
+# similarly for height — at the defaults below, roughly 3% x 2%,
+# versus roughly 10% x 7% for the coarse pass alone.
+EXTRACTION_REF_REFINE_WINDOW_FRAC <- 0.30
+EXTRACTION_REF_REFINE_GRID_COLS <- 10
+EXTRACTION_REF_REFINE_GRID_ROWS <- 10
