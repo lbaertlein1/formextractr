@@ -1,5 +1,26 @@
 # utils_extraction.R
 #
+# CURRENT PRIMARY PATH: extract_submission_holistic() — one API call per
+# submission, sending the whole (unmodified) submission image plus every
+# field's name/type/instructions, and asking for one structured JSON
+# response covering every field at once. No alignment step of any kind:
+# Claude locates each field by reading the form's own printed labels and
+# structure, rather than by a precomputed geometric position. See that
+# function's own docstring below, and build_holistic_prompt() for the
+# actual prompt.
+#
+# This replaced the per-field crop + reference-point alignment pipeline
+# that used to live in this file (still present below, unused — see the
+# "LEGACY" section marker). That pipeline's real failure mode turned out
+# to be locating fields correctly across submission photos with varying
+# framing/rotation/crop, not reading a field once correctly located —
+# and reading models are much better suited to "find this on the page by
+# its label" than to producing the precise pixel coordinates a geometric
+# transform needs. Rather than keep hardening the alignment step (more
+# reference points, better fallbacks, drag-to-correct UI), giving Claude
+# the whole page removes the need for that step to exist at all.
+#
+# ---- LEGACY (kept, unused, not called from mod_extraction.R) ----------
 # Field-level extraction via the Claude API (vision). Each field's
 # annotated bounding box gets cropped out of a submission image and sent
 # as a single-field question, with the prompt tailored to the field's
@@ -68,6 +89,7 @@
 # the similarity/affine/perspective fit; a separate blind pre-rotation
 # pass would be redundant at best.
 
+
 library(httr2)
 library(base64enc)
 library(magick)
@@ -77,52 +99,442 @@ library(magick)
 #' format wrapper (confidence + value) is applied separately in
 #' build_field_prompt() so that contract lives in exactly one place.
 build_field_instructions <- function(field) {
-  common_blank <- "If the area is blank, the value is: BLANK"
-
-  switch(field$type,
-    "text_printed" = paste(
-      "Read the printed text in this image crop from a paper form.",
-      "The value is the text content, nothing else.", common_blank
-    ),
-    "text_handwritten" = paste(
-      "Read the handwritten text in this image crop from a paper form.",
-      "The value is the text content, nothing else.",
-      "If the area is blank or illegible, the value is: BLANK"
-    ),
-    "date_handwritten" = paste(
-      "Read the handwritten date in this image crop from a paper form.",
-      "The value is the date in YYYY-MM-DD format if you can determine it.",
-      common_blank,
-      "If a date is present but the day/month/year is ambiguous or illegible, the value is: UNCLEAR"
-    ),
-    "numeric" = paste(
-      "Read the number written in this image crop from a paper form.",
-      "The value is the digits only, no other text, no commas.", common_blank
-    ),
-    "checkbox" = paste(
-      "Look at this image crop of a checkbox from a paper form.",
-      "The value is CHECKED if it is filled in/marked, or UNCHECKED if it is empty."
-    ),
-    "circled_text" = {
-      opts <- trimws(strsplit(field$options, ";")[[1]])
-      sprintf(paste(
-        "This image crop shows a printed list of options from a paper form: %s.",
-        "Exactly one option should be circled, underlined, or otherwise marked as selected.",
-        "The value is the exact text of the selected option, matching one of the options listed.",
-        "If none appear selected, the value is: BLANK",
-        "If it's ambiguous which one is selected, the value is: UNCLEAR"
-      ), paste(opts, collapse = ", "))
-    },
-    "tally_count" = paste(
-      "This image crop shows handwritten tally/hash marks on a paper form",
-      "(individual strokes, sometimes grouped in 5s with a diagonal strike through each group of 4).",
-      "Count the TOTAL number of individual marks (a group of 5 counts as 5, not 1).",
-      "The value is the total count as a single integer.",
-      "If there are none, the value is: 0"
-    ),
-    # fallback for any future/unrecognized type
-    "Read the content of this image crop from a paper form. The value is the content, nothing else."
+  common_blank <- paste(
+    "If the area is blank — meaning no respondent-entered handwriting,",
+    "mark, or tally stroke is present — the value is: BLANK. Some forms",
+    "pre-print placeholder text or symbols in otherwise-unfilled cells",
+    "(e.g. a printed \"00000\" or a row of underscores, used as a",
+    "template watermark, not as data). Printed placeholder content like",
+    "that does NOT count as a value — if that's the only thing present,",
+    "the cell is still BLANK, not the placeholder's literal text."
   )
+  
+  switch(field$type,
+         "text_printed" = paste(
+           "Read the printed text in this image crop from a paper form.",
+           "The value is the text content, nothing else.", common_blank
+         ),
+         "text_handwritten" = paste(
+           "Read the handwritten text in this image crop from a paper form.",
+           "The value is the text content, nothing else.",
+           "If the area is blank or illegible, the value is: BLANK"
+         ),
+         "date_handwritten" = paste(
+           "Read the handwritten date in this image crop from a paper form.",
+           "The value is the date in YYYY-MM-DD format if you can determine it.",
+           common_blank,
+           "If a date is present but the day/month/year is ambiguous or illegible, the value is: UNCLEAR"
+         ),
+         "numeric_handwritten" = paste(
+           "Read the respondent-entered number for this field — a handwritten",
+           "digit or total, or a count of handwritten tally/hash marks if",
+           "that's how this form records it. The value is the digits only,",
+           "no other text, no commas. Pre-printed digits or placeholder text",
+           "(part of the blank form itself, not something the respondent",
+           "wrote) never satisfy this field on their own — only handwriting",
+           "counts.", common_blank
+         ),
+         "numeric_printed" = paste(
+           "Read the printed number in this image crop from a paper form —",
+           "for example a form/serial number or a printed reference code.",
+           "The value is the digits only, no other text, no commas.", common_blank
+         ),
+         # Legacy alias: templates saved before numeric_handwritten/
+         # numeric_printed existed as separate types used a single "numeric"
+         # type covering both cases, with no way to tell a form's genuine
+         # pre-printed placeholder digits (e.g. "00000") apart from actual
+         # handwritten data — exactly the ambiguity that split this type in
+         # the first place. Defaults to the handwritten behavior since
+         # that's the overwhelmingly common case for this app's forms; a
+         # template still using the bare "numeric" type should be re-typed
+         # to numeric_handwritten or numeric_printed in the Template
+         # Designer rather than left relying on this fallback.
+         "numeric" = paste(
+           "Read the respondent-entered number for this field — a handwritten",
+           "digit or total, or a count of handwritten tally/hash marks if",
+           "that's how this form records it. The value is the digits only,",
+           "no other text, no commas. Pre-printed digits or placeholder text",
+           "(part of the blank form itself, not something the respondent",
+           "wrote) never satisfy this field on their own — only handwriting",
+           "counts.", common_blank
+         ),
+         "checkbox" = paste(
+           "Look at this image crop of a checkbox from a paper form.",
+           "The value is CHECKED if it is filled in/marked, or UNCHECKED if it is empty."
+         ),
+         "circled_text" = {
+           opts <- trimws(strsplit(field$options, ";")[[1]])
+           sprintf(paste(
+             "This image crop shows a printed list of options from a paper form: %s.",
+             "Exactly one option should be circled, underlined, or otherwise marked as selected.",
+             "The value is the exact text of the selected option, matching one of the options listed.",
+             "If none appear selected, the value is: BLANK",
+             "If it's ambiguous which one is selected, the value is: UNCLEAR"
+           ), paste(opts, collapse = ", "))
+         },
+         "tally_count" = paste(
+           "This image crop shows handwritten tally/hash marks on a paper form",
+           "(individual strokes, sometimes grouped in 5s with a diagonal strike through each group of 4).",
+           "Count the TOTAL number of individual marks (a group of 5 counts as 5, not 1).",
+           "Pre-printed placeholder text underneath or around where marks would",
+           "go (e.g. a printed \"00000\" watermark) is not itself a mark — only",
+           "count actual handwritten strokes.",
+           "The value is the total count as a single integer.",
+           "If there are none, the value is: 0"
+         ),
+         # fallback for any future/unrecognized type
+         "Read the content of this image crop from a paper form. The value is the content, nothing else."
+  )
+}
+
+#' Convert a field's normalized template position (x, y, w, h — still
+#' stored on every field from the Template Designer, just no longer
+#' used for cropping) into a coarse, human-readable location hint —
+#' "upper-left area of the page", not a fraction or pixel coordinate.
+#'
+#' This is deliberately a soft HINT, not a crop instruction: nothing
+#' downstream maps it through a geometric transform, so it can never
+#' send Claude to the wrong pixels the way the old per-field-crop
+#' pipeline could when alignment drifted. Worst case if a submission's
+#' photo is framed very differently from the template, the hint is
+#' mildly unhelpful — Claude still reads the field by its name and the
+#' form's own labels either way, the same as it does now; this just
+#' narrows where to look first, especially useful on a dense form with
+#' many similarly-typed fields (a grid of numeric tally totals, say)
+#' where the field name alone doesn't visually disambiguate as fast.
+#'
+#' Deliberately coarse (thirds, not finer) and verbal rather than
+#' numeric — asking a vision model to use a precise continuous
+#' fraction is a known weak spot (see locate_reference_points_holistic()'s
+#' history below), but a coarse named region is exactly the kind of
+#' spatial cue models use reliably.
+describe_field_position <- function(field) {
+  cx <- field$x + field$w / 2
+  cy <- field$y + field$h / 2
+  h_pos <- if (cx < 1/3) "left" else if (cx < 2/3) "center" else "right"
+  v_pos <- if (cy < 1/3) "upper" else if (cy < 2/3) "middle" else "lower"
+  sprintf("%s-%s area of the page", v_pos, h_pos)
+}
+
+#' Build the full extraction prompt for EVERY field in a template at
+#' once — the "send the whole submission" approach: one image, one
+#' API call, one structured JSON response covering all fields.
+#'
+#' Fields are addressed by field_id (not field_name) in both the
+#' prompt and the parsed response, since names aren't guaranteed
+#' unique on a template (e.g. "Facility Type" can legitimately appear
+#' twice — a free-text field and a separate circled_text field further
+#' down the same form).
+#'
+#' Reuses build_field_instructions() so a given field type reads
+#' exactly the same whether it's being asked about in isolation (the
+#' old per-field path, still present below for now) or as part of this
+#' combined prompt — the only things this function adds are the coarse
+#' position hint (describe_field_position(), above), the JSON
+#' response-format wrapper, and the "read the whole form" framing.
+build_holistic_prompt <- function(fields) {
+  field_blocks <- vapply(seq_len(nrow(fields)), function(i) {
+    field <- as.list(fields[i, ])
+    sprintf("Field ID: %s\nField name: %s\nApproximate location on the form: %s\nInstructions: %s",
+            field$field_id, field$name, describe_field_position(field),
+            build_field_instructions(field))
+  }, character(1))
+  
+  sprintf(paste(
+    "This image is a scanned or photographed paper form. FIRST, before",
+    "extracting anything, decide whether this image is actually a",
+    "submission of the expected form — the one whose fields are listed",
+    "below.",
+    "",
+    "This is a STRUCTURAL check, not just an identity check. Two forms",
+    "can share the same title, the same general subject, and a broadly",
+    "similar look while genuinely being different layouts — a different",
+    "revision or version of the same form family. Watch specifically",
+    "for: a category split into a different number of parts than the",
+    "fields below expect (e.g. the fields below expect three age",
+    "brackets in a table, but this page only has two, with two of them",
+    "merged into one); two fields the list below expects separately",
+    "that are combined into one on this page, or vice versa; a whole",
+    "section present in one but not the other; renamed labels for the",
+    "same concept (harmless on its own, but a signal to look more",
+    "closely at the surrounding structure too). If the fields below,",
+    "read together, don't actually correspond to distinct locations you",
+    "can point to on this specific page — because the page's real",
+    "structure doesn't match what the fields assume — that's NOT a",
+    "match, even if the title and general subject are identical.",
+    "",
+    "A blank, partially filled, poor-quality, rotated, or oddly-cropped",
+    "photo of a page with the RIGHT structure still counts as a match —",
+    "this check is about the form's layout, not its condition or how",
+    "much of it happens to be filled in.",
+    "",
+    "If it does NOT match: set every field's value to BLANK and",
+    "confidence to LOW without trying to guess data from unrelated",
+    "content — do not attempt to map fields onto a different form's",
+    "layout just because some values might superficially fit (e.g. never",
+    "pull a value from a merged category into a field that expects one",
+    "of several separate categories, or vice versa).",
+    "",
+    "If it DOES match, extract the value of EVERY field listed below by",
+    "reading the form as a whole — use the printed row/column labels",
+    "and surrounding structure to find each one, the same way a careful",
+    "human reviewer would. Each field's \"approximate location\" is a",
+    "rough starting hint from a clean reference copy of this form —",
+    "treat it as a place to look first, not a guarantee, since this",
+    "particular photo may be framed or rotated differently; if a field",
+    "isn't where the hint suggests, find it anyway by its name and the",
+    "form's own structure. If a value is stylized or ambiguous on its",
+    "own, compare it against clearer handwriting elsewhere on the same",
+    "form before deciding.",
+    "",
+    "IMPORTANT: some forms pre-print placeholder text or symbols in",
+    "cells that haven't been filled in yet — for example a printed",
+    "\"00000\", a row of underscores, or some other repeated character",
+    "used as a watermark for an as-yet-unanswered field. If you see",
+    "printed placeholder content like that, it's part of the blank form",
+    "template itself, not data a respondent entered — a cell showing",
+    "only such placeholder content, with no actual handwriting, mark,",
+    "or tally stroke over or near it, is BLANK. Never report a",
+    "pre-printed placeholder's literal text as a field's value.",
+    "",
+    "Fields to extract:",
+    "%s",
+    "",
+    "Respond with ONLY a single JSON object, no other text before or",
+    "after it, no markdown code fences. It must have a \"form_match\"",
+    "key first: {\"is_match\": true or false, \"reason\": \"<one short",
+    "sentence — required if is_match is false, explaining what you saw",
+    "instead; omit or leave empty if is_match is true>\"}. Every other",
+    "key is one of the Field IDs above (exactly as given), each mapping",
+    "to an object of the form {\"confidence\": \"HIGH\" or \"LOW\",",
+    "\"value\": \"<the extracted value, per that field's instructions",
+    "above>\"}. Every Field ID listed above must appear as a key exactly",
+    "once, even when is_match is false (with value BLANK and confidence",
+    "LOW, per the instructions above).",
+    "",
+    "Use LOW confidence for any field where the handwriting is unclear,",
+    "stylized in a way that could plausibly be misread, ambiguous, or",
+    "you are guessing at all. Use HIGH only if you are confident the",
+    "value is unambiguous.",
+    sep = "\n"
+  ), paste(field_blocks, collapse = "\n\n"))
+}
+
+#' Resize a COPY of an image so its long edge is at most `max_dim` px,
+#' leaving the original untouched. The API downscales internally to a
+#' model-dependent limit regardless (~1568px long edge on most current
+#' models; higher on Opus 4.7+/Mythos-tier), so pre-resizing here
+#' mainly controls exactly what gets transmitted/billed rather than
+#' changing what the model ultimately sees — but doing it explicitly
+#' keeps that behavior visible and tunable in one place (see
+#' EXTRACTION_HOLISTIC_MAX_DIM in config.R) instead of left as an
+#' implicit server-side default.
+resize_for_api <- function(img, max_dim) {
+  info <- magick::image_info(img)
+  long_edge <- max(info$width[1], info$height[1])
+  if (long_edge <= max_dim) return(img)
+  magick::image_resize(img, sprintf("%dx%d", max_dim, max_dim))
+}
+
+#' Extract every field in a template from ONE submission with a SINGLE
+#' API call: the whole page image plus every field's instructions, in
+#' one message — no alignment step of any kind (no reference points,
+#' no homography, no border detection, no per-field crop). See this
+#' file's module-level comment for the reasoning; short version: the
+#' old per-field-crop pipeline's actual failure mode was locating
+#' fields correctly across differently-framed photos, not reading them
+#' once located, and a model shown the whole page locates content by
+#' reading labels rather than by trusting computed pixel coordinates —
+#' which sidesteps that failure mode instead of trying to make the
+#' geometry more robust to it.
+#'
+#' @param api_key Anthropic API key
+#' @param submission_img_path Path to the (already PDF-converted, if
+#'   applicable) submission image
+#' @param template A loaded template (list with `fields`; `image_width`/
+#'   `image_height`/`reference_points` are not used by this function —
+#'   nothing here computes a geometric mapping of any kind)
+#' @param retries Passed through to the underlying HTTP call
+#' @return list(
+#'   results = data.frame(field_name, field_type, value, confidence,
+#'     error) — one row per field. No sub_x0/y0/x1/y1 columns: nothing
+#'     crops per field anymore, so there's no per-field box to report.
+#'     If the submission doesn't match the template (see form_match
+#'     below), every row's value is forced to NA (BLANK) and confidence
+#'     to LOW here in code — not left to depend on the model actually
+#'     having followed that instruction on its own,
+#'   image_path = path to the (unmodified, full-resolution) submission
+#'     image — used by the review UI to display the source image,
+#'   align_method = "holistic" — kept as a field for compatibility with
+#'     any caller that still inspects this; there's no alignment step
+#'     to name,
+#'   form_match = list(is_match, reason) — is_match is TRUE/FALSE, or
+#'     NA if this couldn't be determined (call/parse failure, or a
+#'     well-formed response that unexpectedly omitted the form_match
+#'     key). Callers should treat NA the same as a normal extraction
+#'     attempt (per-field error/confidence already reflects whatever
+#'     went wrong) — NA is not itself a mismatch signal, only FALSE is
+#' )
+extract_submission_holistic <- function(api_key, submission_img_path, template, retries = 1) {
+  img <- magick::image_read(submission_img_path)  # ORIGINAL, unmodified — this is what's saved/shown later
+  
+  image_path <- tempfile(fileext = ".png")
+  magick::image_write(img, image_path, format = "png")
+  
+  fields <- as.data.frame(template$fields, stringsAsFactors = FALSE)
+  prompt <- build_holistic_prompt(fields)
+  
+  api_img <- resize_for_api(img, EXTRACTION_HOLISTIC_MAX_DIM)
+  api_tmp <- tempfile(fileext = ".png")
+  magick::image_write(api_img, api_tmp, format = "png")
+  img_b64 <- base64enc::base64encode(api_tmp)
+  unlink(api_tmp)
+  
+  body <- list(
+    model = EXTRACTION_MODEL,
+    max_tokens = EXTRACTION_HOLISTIC_MAX_TOKENS,
+    messages = list(list(
+      role = "user",
+      content = list(
+        list(type = "image", source = list(type = "base64", media_type = "image/png", data = img_b64)),
+        list(type = "text", text = prompt)
+      )
+    ))
+  )
+  
+  attempt <- function() {
+    httr2::request(ANTHROPIC_API_URL) |>
+      httr2::req_headers(
+        "x-api-key" = api_key,
+        "anthropic-version" = ANTHROPIC_API_VERSION,
+        "content-type" = "application/json"
+      ) |>
+      httr2::req_body_json(body) |>
+      httr2::req_timeout(120) |>
+      httr2::req_error(is_error = function(resp) FALSE) |>
+      httr2::req_perform()
+  }
+  
+  resp <- tryCatch(attempt(), error = function(e) e)
+  if (inherits(resp, "error") && retries > 0) {
+    Sys.sleep(2)
+    resp <- tryCatch(attempt(), error = function(e) e)
+  }
+  
+  parsed_fields <- NULL
+  call_error <- NA_character_
+  
+  if (inherits(resp, "error")) {
+    call_error <- paste("Connection failed:", conditionMessage(resp))
+  } else {
+    status <- httr2::resp_status(resp)
+    if (status >= 400) {
+      err_body <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
+      call_error <- if (!is.null(err_body$error$message)) {
+        sprintf("API error (HTTP %d): %s", status, err_body$error$message)
+      } else {
+        sprintf("API error (HTTP %d)", status)
+      }
+      if (status %in% c(429, 500, 502, 503, 529) && retries > 0) {
+        return(extract_submission_holistic(api_key, submission_img_path, template, retries = retries - 1))
+      }
+    } else {
+      body_parsed <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
+      
+      # Check stop_reason BEFORE attempting to parse — a response cut
+      # off by hitting max_tokens (thinking + output together, per
+      # EXTRACTION_HOLISTIC_MAX_TOKENS's comment above) is almost never
+      # valid JSON, but "couldn't parse JSON" doesn't tell you WHY,
+      # which looks identical to a genuine model formatting mistake.
+      # Distinguishing it here means this doesn't have to get
+      # re-diagnosed from scratch the next time it happens. Retried
+      # automatically once (like a transient error) since raising
+      # max_tokens is the actual fix and a single retry at the same
+      # budget may still just truncate again — but it's cheap insurance
+      # against a one-off unusually long response.
+      if (!is.null(body_parsed$stop_reason) && identical(body_parsed$stop_reason, "max_tokens")) {
+        if (retries > 0) {
+          message("extract_submission_holistic(): response hit max_tokens (", EXTRACTION_HOLISTIC_MAX_TOKENS,
+                  ") before completing — retrying once.")
+          return(extract_submission_holistic(api_key, submission_img_path, template, retries = retries - 1))
+        }
+        call_error <- sprintf(
+          "Response was cut off after hitting the %d max_tokens limit before finishing — increase EXTRACTION_HOLISTIC_MAX_TOKENS in config.R.",
+          EXTRACTION_HOLISTIC_MAX_TOKENS
+        )
+      } else {
+        text_blocks <- if (!is.null(body_parsed$content)) {
+          Filter(function(b) identical(b$type, "text"), body_parsed$content)
+        } else list()
+        raw_text <- if (length(text_blocks) > 0) trimws(text_blocks[[1]]$text) else ""
+        # Strip ```json fences if present despite being told not to add them.
+        raw_text <- sub("^```(json)?\\s*", "", raw_text)
+        raw_text <- sub("\\s*```$", "", raw_text)
+        parsed_fields <- tryCatch(jsonlite::fromJSON(raw_text, simplifyVector = FALSE),
+                                  error = function(e) NULL)
+        if (is.null(parsed_fields)) {
+          call_error <- "Couldn't parse the model's response as JSON — see console for the raw text."
+          message("extract_submission_holistic(): unparseable response (stop_reason: ",
+                  if (!is.null(body_parsed$stop_reason)) body_parsed$stop_reason else "unknown", "):\n", raw_text)
+        }
+      }
+    }
+  }
+  
+  # form_match is a reserved top-level key alongside the per-field ones
+  # (never collides with a real field — field IDs are UUIDs). Enforced
+  # here in code, not just requested in the prompt: if the model says
+  # this isn't the expected form, every field gets forced to BLANK/LOW
+  # regardless of whatever per-field values it may have also returned —
+  # a model that's told "don't guess" can still guess, so the response
+  # isn't trusted to have actually left fields blank on its own.
+  form_match <- if (!is.null(parsed_fields) && !is.null(parsed_fields[["form_match"]])) {
+    fm <- parsed_fields[["form_match"]]
+    list(
+      is_match = if (!is.null(fm$is_match)) isTRUE(fm$is_match) else NA,
+      reason = if (!is.null(fm$reason)) as.character(fm$reason) else NA_character_
+    )
+  } else if (is.na(call_error)) {
+    # Call succeeded and parsed, but no form_match key came back —
+    # treat as unknown rather than assuming a match, so this doesn't
+    # silently fall through to normal extraction on a malformed response.
+    list(is_match = NA, reason = "Model's response didn't include a form_match assessment")
+  } else {
+    list(is_match = NA, reason = NA_character_)  # call/parse failure — see call_error on every field instead
+  }
+  mismatch <- isFALSE(form_match$is_match)
+  
+  n_fields <- nrow(fields)
+  results <- vector("list", n_fields)
+  for (i in seq_len(n_fields)) {
+    field <- as.list(fields[i, ])
+    fid <- field$field_id
+    entry <- if (!is.null(parsed_fields)) parsed_fields[[fid]] else NULL
+    
+    if (mismatch) {
+      value <- NA_character_; confidence <- "LOW"
+      err <- paste("Submission does not appear to match the template:",
+                   if (!is.na(form_match$reason) && nzchar(form_match$reason)) form_match$reason else "no reason given")
+    } else if (!is.na(call_error)) {
+      value <- NA_character_; confidence <- "UNKNOWN"; err <- call_error
+    } else if (is.null(entry)) {
+      value <- NA_character_; confidence <- "UNKNOWN"
+      err <- "Field missing from the model's response"
+    } else {
+      value <- if (!is.null(entry$value)) as.character(entry$value) else NA_character_
+      confidence <- if (!is.null(entry$confidence)) toupper(as.character(entry$confidence)) else "UNKNOWN"
+      err <- NA_character_
+    }
+    
+    results[[i]] <- data.frame(
+      field_name = field$name, field_type = field$type,
+      value = value, confidence = confidence, error = err,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  list(results = do.call(rbind, results), image_path = image_path, align_method = "holistic",
+       form_match = form_match)
 }
 
 #' Shared response-format contract, wrapped around the type-specific
@@ -184,23 +596,23 @@ crop_field_image <- function(submission_img, field, transform_fn, template_width
   y0t <- field$y * template_height
   x1t <- (field$x + field$w) * template_width
   y1t <- (field$y + field$h) * template_height
-
+  
   corners <- list(
     transform_fn(x0t, y0t), transform_fn(x1t, y0t),
     transform_fn(x0t, y1t), transform_fn(x1t, y1t)
   )
   xs <- vapply(corners, function(c) c$x, numeric(1))
   ys <- vapply(corners, function(c) c$y, numeric(1))
-
+  
   sub_info <- magick::image_info(submission_img)
   sub_w <- sub_info$width[1]; sub_h <- sub_info$height[1]
-
+  
   x0 <- max(0, min(xs)); y0 <- max(0, min(ys))
   x1 <- min(sub_w, max(xs)); y1 <- min(sub_h, max(ys))
   w <- max(1, round(x1 - x0)); h <- max(1, round(y1 - y0))
-
+  
   cropped <- magick::image_crop(submission_img, sprintf("%dx%d+%d+%d", w, h, round(x0), round(y0)))
-
+  
   if (min(w, h) < EXTRACTION_MIN_CROP_DIM) {
     scale <- ceiling(EXTRACTION_MIN_CROP_DIM / max(1, min(w, h)))
     # Explicit target pixel dims + "!", not percentage geometry — see
@@ -208,7 +620,7 @@ crop_field_image <- function(submission_img, field, transform_fn, template_width
     # sensitivity, confirmed as a real bug earlier in this project).
     cropped <- magick::image_resize(cropped, sprintf("%dx%d!", w * scale, h * scale))
   }
-
+  
   tmp <- tempfile(fileext = ".png")
   magick::image_write(cropped, tmp, format = "png")
   list(path = tmp, x0 = x0, y0 = y0, x1 = x1, y1 = y1)
@@ -222,7 +634,7 @@ crop_field_image <- function(submission_img, field, transform_fn, template_width
 extract_field_value <- function(api_key, image_path, field, retries = 1) {
   img_b64 <- base64enc::base64encode(image_path)
   prompt <- build_field_prompt(field)
-
+  
   body <- list(
     model = EXTRACTION_MODEL,
     max_tokens = 200,
@@ -234,7 +646,7 @@ extract_field_value <- function(api_key, image_path, field, retries = 1) {
       )
     ))
   )
-
+  
   attempt <- function() {
     httr2::request(ANTHROPIC_API_URL) |>
       httr2::req_headers(
@@ -247,20 +659,20 @@ extract_field_value <- function(api_key, image_path, field, retries = 1) {
       httr2::req_error(is_error = function(resp) FALSE) |>  # never auto-throw; we inspect status ourselves below
       httr2::req_perform()
   }
-
+  
   resp <- tryCatch(attempt(), error = function(e) e)
   if (inherits(resp, "error") && retries > 0) {
     Sys.sleep(2)
     resp <- tryCatch(attempt(), error = function(e) e)
   }
-
+  
   if (inherits(resp, "error")) {
     # Genuine network/connection failure (DNS, TLS, timeout) — never
     # reached Anthropic's servers at all.
     return(list(value = NA_character_, confidence = "UNKNOWN",
                 error = paste("Connection failed:", conditionMessage(resp))))
   }
-
+  
   status <- httr2::resp_status(resp)
   if (status >= 400) {
     # Anthropic returns a structured {"error":{"message":...}} body on
@@ -273,7 +685,7 @@ extract_field_value <- function(api_key, image_path, field, retries = 1) {
     } else {
       tryCatch(httr2::resp_body_string(resp), error = function(e) "(no response body)")
     }
-
+    
     if (status %in% c(429, 500, 502, 503, 529) && retries > 0) {
       Sys.sleep(2)
       return(extract_field_value(api_key, image_path, field, retries = retries - 1))
@@ -281,25 +693,25 @@ extract_field_value <- function(api_key, image_path, field, retries = 1) {
     return(list(value = NA_character_, confidence = "UNKNOWN",
                 error = sprintf("API error (HTTP %d): %s", status, err_msg)))
   }
-
+  
   parsed <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
   if (is.null(parsed) || is.null(parsed$content)) {
     return(list(value = NA_character_, confidence = "UNKNOWN", error = "Unexpected API response shape"))
   }
-
+  
   text_blocks <- Filter(function(b) identical(b$type, "text"), parsed$content)
   raw_text <- if (length(text_blocks) > 0) trimws(text_blocks[[1]]$text) else ""
-
+  
   # Parse the "CONFIDENCE: .../VALUE: ..." format. If the model didn't
   # follow it for some reason, fall back to the raw text as the value
   # and mark confidence UNKNOWN — which gets flagged for review just
   # like LOW, since we can't verify it was a clean read.
   conf_m  <- regmatches(raw_text, regexec("CONFIDENCE:\\s*(HIGH|LOW)", raw_text, ignore.case = TRUE))[[1]]
   value_m <- regmatches(raw_text, regexec("VALUE:\\s*(.*)", raw_text, ignore.case = TRUE))[[1]]
-
+  
   confidence <- if (length(conf_m) >= 2) toupper(conf_m[2]) else "UNKNOWN"
   value <- if (length(value_m) >= 2) trimws(value_m[2]) else raw_text
-
+  
   list(value = value, confidence = confidence, error = NULL)
 }
 
@@ -338,15 +750,15 @@ detect_page_border <- function(img, brightness_threshold = EXTRACTION_BORDER_BRI
   gray <- magick::image_convert(img, colorspace = "gray")
   info <- magick::image_info(gray)
   w <- info$width[1]; h <- info$height[1]
-
+  
   row_avg <- as.integer(magick::image_data(magick::image_resize(gray, sprintf("1x%d!", h)), channels = "gray"))
   col_avg <- as.integer(magick::image_data(magick::image_resize(gray, sprintf("%dx1!", w)), channels = "gray"))
-
+  
   top_rows <- which(row_avg < brightness_threshold)
   left_cols <- which(col_avg < brightness_threshold)
-
+  
   if (length(top_rows) == 0 || length(left_cols) == 0) return(NULL)
-
+  
   list(top = min(top_rows), bottom = max(top_rows),
        left = min(left_cols), right = max(left_cols))
 }
@@ -372,25 +784,25 @@ fit_border_transform <- function(img, template_border, template_width, template_
   if (is.null(template_border)) {
     return(fit_plain_scale_transform(img, template_width, template_height))
   }
-
+  
   sub_border <- detect_page_border(img)
   if (is.null(sub_border)) {
     message("Couldn't detect this submission's outer border — falling back to plain scale (no border alignment) for it.")
     return(fit_plain_scale_transform(img, template_width, template_height))
   }
-
+  
   sub_w <- sub_border$right - sub_border$left
   sub_h <- sub_border$bottom - sub_border$top
   if (sub_w < 10 || sub_h < 10) {
     message("Detected submission border was implausibly small — falling back to plain scale for it.")
     return(fit_plain_scale_transform(img, template_width, template_height))
   }
-
+  
   tmpl_w <- template_border$right - template_border$left
   tmpl_h <- template_border$bottom - template_border$top
   scale_x <- sub_w / tmpl_w
   scale_y <- sub_h / tmpl_h
-
+  
   function(tmpl_x, tmpl_y) {
     list(x = sub_border$left + (tmpl_x - template_border$left) * scale_x,
          y = sub_border$top + (tmpl_y - template_border$top) * scale_y)
@@ -430,7 +842,7 @@ ocr_patch <- function(api_key, patch_img) {
   img_b64 <- tryCatch(base64enc::base64encode(tmp), error = function(e) NA_character_)
   unlink(tmp)
   if (is.na(img_b64)) return(NA_character_)
-
+  
   body <- list(
     model = EXTRACTION_MODEL, max_tokens = 100,
     messages = list(list(role = "user", content = list(
@@ -442,15 +854,15 @@ ocr_patch <- function(api_key, patch_img) {
       ))
     )))
   )
-
+  
   resp <- tryCatch({
     httr2::request(ANTHROPIC_API_URL) |>
       httr2::req_headers("x-api-key" = api_key, "anthropic-version" = ANTHROPIC_API_VERSION,
-                          "content-type" = "application/json") |>
+                         "content-type" = "application/json") |>
       httr2::req_body_json(body) |> httr2::req_timeout(30) |>
       httr2::req_error(is_error = function(resp) FALSE) |> httr2::req_perform()
   }, error = function(e) e)
-
+  
   if (inherits(resp, "error") || httr2::resp_status(resp) >= 400) return(NA_character_)
   parsed <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
   if (is.null(parsed) || is.null(parsed$content)) return(NA_character_)
@@ -471,7 +883,7 @@ ocr_patch <- function(api_key, patch_img) {
 annotate_template_with_refpoints <- function(template_img, reference_points) {
   info <- magick::image_info(template_img)
   w <- info$width[1]; h <- info$height[1]
-
+  
   img <- magick::image_draw(template_img)
   for (i in seq_len(nrow(reference_points))) {
     r <- reference_points[i, ]
@@ -504,7 +916,7 @@ draw_coordinate_grid <- function(img, n_cols = EXTRACTION_REF_GRID_COLS, n_rows 
   w <- info$width[1]; h <- info$height[1]
   cell_w <- w / n_cols
   cell_h <- h / n_rows
-
+  
   out <- magick::image_draw(img)
   grid_col <- grDevices::rgb(0, 0.4, 1, 0.55)
   for (c in 0:n_cols) {
@@ -572,10 +984,10 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
   n <- nrow(reference_points)
   na_result <- function(err = NULL) list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = err)
   if (n == 0) return(list())
-
+  
   message(sprintf("---- Auto-suggest (holistic): starting for %d reference point(s): %s ----",
-                   n, paste(reference_points$name, collapse = ", ")))
-
+                  n, paste(reference_points$name, collapse = ", ")))
+  
   annotated <- tryCatch(annotate_template_with_refpoints(template_img, reference_points), error = function(e) {
     message("Auto-suggest: annotate_template_with_refpoints() failed: ", conditionMessage(e))
     NULL
@@ -585,7 +997,7 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
   }
   ann_info <- magick::image_info(annotated)
   message(sprintf("Auto-suggest: annotated template OK, %dx%d", ann_info$width[1], ann_info$height[1]))
-
+  
   downscale <- function(img) {
     info <- magick::image_info(img)
     iw <- info$width[1]; ih <- info$height[1]
@@ -595,7 +1007,7 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
   }
   annotated_small <- downscale(annotated)
   submission_small <- downscale(submission_img)
-
+  
   # Grid overlay on the (downscaled) submission — see draw_coordinate_grid()'s
   # doc comment for why: asking for a cell label is far more reliable
   # than asking for a continuous fraction, which testing showed the
@@ -604,16 +1016,16 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
     message("Auto-suggest: draw_coordinate_grid() failed, falling back to ungridded submission: ", conditionMessage(e))
     submission_small
   })
-
+  
   sub_info <- magick::image_info(submission_img)
   sub_w <- sub_info$width[1]; sub_h <- sub_info$height[1]
   small_tmpl_info <- magick::image_info(annotated_small)
   small_sub_info <- magick::image_info(submission_gridded)
   message(sprintf("Auto-suggest: sending template %dx%d, submission (gridded, %dx%d cells) %dx%d (submission's own real size is %dx%d)",
-                   small_tmpl_info$width[1], small_tmpl_info$height[1],
-                   EXTRACTION_REF_GRID_COLS, EXTRACTION_REF_GRID_ROWS,
-                   small_sub_info$width[1], small_sub_info$height[1], sub_w, sub_h))
-
+                  small_tmpl_info$width[1], small_tmpl_info$height[1],
+                  EXTRACTION_REF_GRID_COLS, EXTRACTION_REF_GRID_ROWS,
+                  small_sub_info$width[1], small_sub_info$height[1], sub_w, sub_h))
+  
   to_b64 <- function(img) {
     tmp <- tempfile(fileext = ".png")
     magick::image_write(img, tmp, format = "png")
@@ -627,9 +1039,9 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
     message("Auto-suggest: base64-encoding one or both images failed.")
     return(rep(list(na_result("Couldn't encode images for the API call")), n))
   }
-
+  
   point_list <- paste(sprintf("%d. %s", seq_len(n), reference_points$name), collapse = "\n")
-
+  
   prompt <- sprintf(paste(
     "The FIRST image is a BLANK TEMPLATE form, with %d reference points marked",
     "with red boxes and red labels:",
@@ -657,8 +1069,8 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
     "a fraction. If STATUS is NOTFOUND, still fill in CELL as: A1",
     sep = "\n"
   ), n, point_list, EXTRACTION_REF_GRID_COLS, LETTERS[EXTRACTION_REF_GRID_COLS],
-     EXTRACTION_REF_GRID_ROWS, EXTRACTION_REF_GRID_ROWS, n)
-
+  EXTRACTION_REF_GRID_ROWS, EXTRACTION_REF_GRID_ROWS, n)
+  
   body <- list(
     model = EXTRACTION_MODEL, max_tokens = 500,
     messages = list(list(role = "user", content = list(
@@ -669,15 +1081,15 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
       list(type = "text", text = prompt)
     )))
   )
-
+  
   attempt <- function() {
     httr2::request(ANTHROPIC_API_URL) |>
       httr2::req_headers("x-api-key" = api_key, "anthropic-version" = ANTHROPIC_API_VERSION,
-                          "content-type" = "application/json") |>
+                         "content-type" = "application/json") |>
       httr2::req_body_json(body) |> httr2::req_timeout(90) |>
       httr2::req_error(is_error = function(resp) FALSE) |> httr2::req_perform()
   }
-
+  
   resp <- tryCatch(attempt(), error = function(e) e)
   if (inherits(resp, "error")) {
     message("Auto-suggest: connection failed: ", conditionMessage(resp))
@@ -698,7 +1110,7 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
   }
   text_blocks <- Filter(function(b) identical(b$type, "text"), parsed$content)
   raw_text <- if (length(text_blocks) > 0) trimws(text_blocks[[1]]$text) else ""
-
+  
   message("---- Auto-suggest: RAW response text (exactly what the model returned) ----")
   message(raw_text)
   message("---- Auto-suggest: end raw response ----")
@@ -706,11 +1118,11 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
     message("Auto-suggest: stop_reason = ", parsed$stop_reason,
             if (identical(parsed$stop_reason, "max_tokens")) " <-- response was CUT OFF before finishing; try a smaller reference point count or check if max_tokens needs raising" else "")
   }
-
+  
   lines <- trimws(strsplit(raw_text, "\n")[[1]])
   lines <- lines[nzchar(lines)]
   message(sprintf("Auto-suggest: got %d non-empty line(s), expected %d (one per reference point)", length(lines), n))
-
+  
   results <- vector("list", n)
   for (i in seq_len(n)) {
     pt_name <- reference_points$name[i]
@@ -722,7 +1134,7 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
     parts <- trimws(strsplit(lines[i], "\\|")[[1]])
     if (length(parts) < 3) {
       message(sprintf("Auto-suggest: [%s] line %d ('%s') doesn't have 3 pipe-separated parts — got %d.",
-                       pt_name, i, lines[i], length(parts)))
+                      pt_name, i, lines[i], length(parts)))
       results[[i]] <- na_result(sprintf("Couldn't parse line %d of the response", i))
       next
     }
@@ -735,20 +1147,20 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
     found <- status_word %in% c("LOCATED", "FOUND", "YES")
     confidence <- toupper(parts[2])
     cell_label <- parts[3]
-
+    
     frac <- if (found) grid_cell_to_fraction(cell_label) else NULL
     if (found && is.null(frac)) {
       message(sprintf("Auto-suggest: [%s] line %d says LOCATED but cell '%s' doesn't parse as a valid grid reference (expected A-%s, 1-%d) — treating as not found.",
-                       pt_name, i, cell_label, LETTERS[EXTRACTION_REF_GRID_COLS], EXTRACTION_REF_GRID_ROWS))
+                      pt_name, i, cell_label, LETTERS[EXTRACTION_REF_GRID_COLS], EXTRACTION_REF_GRID_ROWS))
     }
-
+    
     if (!found || is.null(frac)) {
       message(sprintf("Auto-suggest: [%s] line %d parsed as NOT FOUND (status='%s', confidence=%s, cell='%s')",
-                       pt_name, i, parts[1], confidence, cell_label))
+                      pt_name, i, parts[1], confidence, cell_label))
       results[[i]] <- list(x = NA_real_, y = NA_real_, confidence = confidence, error = NULL)
     } else {
       message(sprintf("Auto-suggest: [%s] line %d parsed OK — confidence=%s, cell=%s -> fraction=(%.3f, %.3f) -> pixels=(%.1f, %.1f) of %dx%d submission",
-                       pt_name, i, confidence, toupper(cell_label), frac$x, frac$y, frac$x * sub_w, frac$y * sub_h, sub_w, sub_h))
+                      pt_name, i, confidence, toupper(cell_label), frac$x, frac$y, frac$x * sub_w, frac$y * sub_h, sub_w, sub_h))
       results[[i]] <- list(x = frac$x * sub_w, y = frac$y * sub_h, confidence = confidence, error = NULL)
     }
   }
@@ -769,18 +1181,18 @@ locate_reference_points_holistic <- function(api_key, template_img, reference_po
 #' @return list(x, y, confidence, error) — x,y in FULL submission pixel
 #'   coordinates (already converted back from the crop's own frame)
 refine_reference_point <- function(api_key, template_img, ref_point, submission_img,
-                                    center_x_frac, center_y_frac) {
+                                   center_x_frac, center_y_frac) {
   sub_info <- magick::image_info(submission_img)
   sub_w <- sub_info$width[1]; sub_h <- sub_info$height[1]
-
+  
   half <- EXTRACTION_REF_REFINE_WINDOW_FRAC / 2
   window_x0 <- max(0, center_x_frac - half); window_x1 <- min(1, center_x_frac + half)
   window_y0 <- max(0, center_y_frac - half); window_y1 <- min(1, center_y_frac + half)
-
+  
   crop_x0 <- round(window_x0 * sub_w); crop_y0 <- round(window_y0 * sub_h)
   crop_w <- max(10, round((window_x1 - window_x0) * sub_w))
   crop_h <- max(10, round((window_y1 - window_y0) * sub_h))
-
+  
   sub_crop <- tryCatch(
     magick::image_crop(submission_img, sprintf("%dx%d+%d+%d", crop_w, crop_h, crop_x0, crop_y0)),
     error = function(e) NULL
@@ -792,7 +1204,7 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
     draw_coordinate_grid(sub_crop, n_cols = EXTRACTION_REF_REFINE_GRID_COLS, n_rows = EXTRACTION_REF_REFINE_GRID_ROWS),
     error = function(e) sub_crop
   )
-
+  
   # Small template patch for visual reference — same landmark, cropped
   # tight with a bit of padding for context, rather than shown on the
   # whole annotated page (that was pass 1's job).
@@ -810,7 +1222,7 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
   if (is.null(tmpl_patch)) {
     return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = "Couldn't crop template reference patch"))
   }
-
+  
   to_b64 <- function(img) {
     tmp <- tempfile(fileext = ".png")
     magick::image_write(img, tmp, format = "png")
@@ -823,13 +1235,13 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
   if (is.na(tmpl_b64) || is.na(sub_b64)) {
     return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = "Couldn't encode refine-pass images"))
   }
-
+  
   anchor_desc <- if ("anchor_text" %in% names(ref_point) && nzchar(trimws(ref_point$anchor_text))) {
     sprintf('It contains the printed text "%s".', trimws(ref_point$anchor_text))
   } else {
     ""
   }
-
+  
   prompt <- sprintf(paste(
     "The FIRST image is a close-up crop from a BLANK TEMPLATE form, showing a",
     "landmark called \"%s\". %s",
@@ -850,9 +1262,9 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
     "estimated. If NOTFOUND, still write CELL as A1.",
     sep = "\n"
   ), ref_point$name, anchor_desc,
-     EXTRACTION_REF_REFINE_GRID_COLS, LETTERS[EXTRACTION_REF_REFINE_GRID_COLS],
-     EXTRACTION_REF_REFINE_GRID_ROWS, EXTRACTION_REF_REFINE_GRID_ROWS)
-
+  EXTRACTION_REF_REFINE_GRID_COLS, LETTERS[EXTRACTION_REF_REFINE_GRID_COLS],
+  EXTRACTION_REF_REFINE_GRID_ROWS, EXTRACTION_REF_REFINE_GRID_ROWS)
+  
   body <- list(
     model = EXTRACTION_MODEL, max_tokens = 100,
     messages = list(list(role = "user", content = list(
@@ -863,15 +1275,15 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
       list(type = "text", text = prompt)
     )))
   )
-
+  
   attempt <- function() {
     httr2::request(ANTHROPIC_API_URL) |>
       httr2::req_headers("x-api-key" = api_key, "anthropic-version" = ANTHROPIC_API_VERSION,
-                          "content-type" = "application/json") |>
+                         "content-type" = "application/json") |>
       httr2::req_body_json(body) |> httr2::req_timeout(60) |>
       httr2::req_error(is_error = function(resp) FALSE) |> httr2::req_perform()
   }
-
+  
   resp <- tryCatch(attempt(), error = function(e) e)
   if (inherits(resp, "error")) {
     return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN",
@@ -891,7 +1303,7 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
   text_blocks <- Filter(function(b) identical(b$type, "text"), parsed$content)
   raw_text <- if (length(text_blocks) > 0) trimws(text_blocks[[1]]$text) else ""
   message(sprintf("Refine [%s]: raw response = '%s'", ref_point$name, raw_text))
-
+  
   ln <- trimws(strsplit(raw_text, "\n")[[1]])
   ln <- ln[nzchar(ln)]
   if (length(ln) == 0) {
@@ -904,12 +1316,12 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
   found <- toupper(parts[1]) %in% c("LOCATED", "FOUND", "YES")
   confidence <- toupper(parts[2])
   cell_frac <- if (found) grid_cell_to_fraction(parts[3], n_cols = EXTRACTION_REF_REFINE_GRID_COLS,
-                                                 n_rows = EXTRACTION_REF_REFINE_GRID_ROWS) else NULL
-
+                                                n_rows = EXTRACTION_REF_REFINE_GRID_ROWS) else NULL
+  
   if (!found || is.null(cell_frac)) {
     return(list(x = NA_real_, y = NA_real_, confidence = confidence, error = NULL))
   }
-
+  
   # Crop-local fraction -> full-submission fraction -> pixels.
   full_x_frac <- window_x0 + cell_frac$x * (window_x1 - window_x0)
   full_y_frac <- window_y0 + cell_frac$y * (window_y1 - window_y0)
@@ -936,22 +1348,22 @@ refine_reference_point <- function(api_key, template_img, ref_point, submission_
 locate_reference_points_two_pass <- function(api_key, template_img, reference_points, submission_img) {
   n <- nrow(reference_points)
   if (n == 0) return(list())
-
+  
   coarse_results <- locate_reference_points_holistic(api_key, template_img, reference_points, submission_img)
-
+  
   sub_info <- magick::image_info(submission_img)
   sub_w <- sub_info$width[1]; sub_h <- sub_info$height[1]
-
+  
   message(sprintf("---- Two-pass: starting refine pass for %d point(s) ----", n))
-
+  
   final_results <- vector("list", n)
   for (i in seq_len(n)) {
     r <- reference_points[i, ]
     coarse <- coarse_results[[i]]
-
+    
     default_x_frac <- r$x + r$w / 2
     default_y_frac <- r$y + r$h / 2
-
+    
     use_coarse <- !is.na(coarse$x) && identical(coarse$confidence, "HIGH")
     if (use_coarse) {
       center_x_frac <- coarse$x / sub_w
@@ -963,8 +1375,8 @@ locate_reference_points_two_pass <- function(api_key, template_img, reference_po
       center_source <- if (!is.na(coarse$x)) "geometric default (coarse pass was LOW confidence)" else "geometric default (coarse pass didn't find it)"
     }
     message(sprintf("Two-pass: [%s] refine window centered via %s -> (%.3f, %.3f)",
-                     r$name, center_source, center_x_frac, center_y_frac))
-
+                    r$name, center_source, center_x_frac, center_y_frac))
+    
     refined <- tryCatch(
       refine_reference_point(api_key, template_img, r, submission_img, center_x_frac, center_y_frac),
       error = function(e) {
@@ -972,7 +1384,7 @@ locate_reference_points_two_pass <- function(api_key, template_img, reference_po
         list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = conditionMessage(e))
       }
     )
-
+    
     if (!is.na(refined$x) && !is.na(refined$y)) {
       final_results[[i]] <- refined
     } else {
@@ -982,7 +1394,7 @@ locate_reference_points_two_pass <- function(api_key, template_img, reference_po
       # to the review panel (marked LOW so it's visibly flagged).
       message(sprintf("Two-pass: [%s] refine pass didn't confirm a location — using the window-center guess, flagged LOW confidence.", r$name))
       final_results[[i]] <- list(x = center_x_frac * sub_w, y = center_y_frac * sub_h,
-                                  confidence = "LOW", error = NULL)
+                                 confidence = "LOW", error = NULL)
     }
   }
   message("---- Two-pass: done ----")
@@ -1030,7 +1442,7 @@ describe_region <- function(x, y) {
 locate_text_via_api <- function(api_key, haystack_img, anchor_text, region_hint = NULL) {
   info <- magick::image_info(haystack_img)
   img_w <- info$width[1]; img_h <- info$height[1]
-
+  
   # Downscale for the API call if large — full-resolution multi-
   # megapixel form images cost more tokens/time than needed to locate
   # text, and the result (a fraction of image width/height) is
@@ -1041,20 +1453,20 @@ locate_text_via_api <- function(api_key, haystack_img, anchor_text, region_hint 
   } else {
     haystack_img
   }
-
+  
   tmp <- tempfile(fileext = ".png")
   magick::image_write(search_img, tmp, format = "png")
   img_b64 <- tryCatch(base64enc::base64encode(tmp), error = function(e) NA_character_)
   unlink(tmp)
   if (is.na(img_b64)) return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = "Couldn't encode search image"))
-
+  
   region_line <- if (!is.null(region_hint)) {
     sprintf("This text should be located in roughly %s — use that as a strong hint for WHERE to look, especially if similar text might appear elsewhere on the form (e.g. a repeated column header or label).",
             region_hint)
   } else {
     ""
   }
-
+  
   prompt <- sprintf(paste(
     "This image is a scanned paper form. Find this exact text on the form: \"%s\"",
     "",
@@ -1073,7 +1485,7 @@ locate_text_via_api <- function(api_key, haystack_img, anchor_text, region_hint 
     "CONFIDENCE: LOW, X: 0, Y: 0.",
     sep = "\n"
   ), anchor_text, region_line)
-
+  
   body <- list(
     model = EXTRACTION_MODEL, max_tokens = 100,
     messages = list(list(role = "user", content = list(
@@ -1081,21 +1493,21 @@ locate_text_via_api <- function(api_key, haystack_img, anchor_text, region_hint 
       list(type = "text", text = prompt)
     )))
   )
-
+  
   attempt <- function() {
     httr2::request(ANTHROPIC_API_URL) |>
       httr2::req_headers("x-api-key" = api_key, "anthropic-version" = ANTHROPIC_API_VERSION,
-                          "content-type" = "application/json") |>
+                         "content-type" = "application/json") |>
       httr2::req_body_json(body) |> httr2::req_timeout(60) |>
       httr2::req_error(is_error = function(resp) FALSE) |> httr2::req_perform()
   }
-
+  
   resp <- tryCatch(attempt(), error = function(e) e)
   if (inherits(resp, "error")) {
     return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN",
                 error = paste("Connection failed:", conditionMessage(resp))))
   }
-
+  
   status <- httr2::resp_status(resp)
   if (status >= 400) {
     err_body <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
@@ -1103,32 +1515,32 @@ locate_text_via_api <- function(api_key, haystack_img, anchor_text, region_hint 
     return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN",
                 error = sprintf("API error (HTTP %d): %s", status, err_msg)))
   }
-
+  
   parsed <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
   if (is.null(parsed) || is.null(parsed$content)) {
     return(list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = "Unexpected API response shape"))
   }
   text_blocks <- Filter(function(b) identical(b$type, "text"), parsed$content)
   raw_text <- if (length(text_blocks) > 0) trimws(text_blocks[[1]]$text) else ""
-
+  
   found_m <- regmatches(raw_text, regexec("FOUND:\\s*(YES|NO)", raw_text, ignore.case = TRUE))[[1]]
   conf_m  <- regmatches(raw_text, regexec("CONFIDENCE:\\s*(HIGH|LOW)", raw_text, ignore.case = TRUE))[[1]]
   x_m <- regmatches(raw_text, regexec("X:\\s*([0-9.]+)", raw_text))[[1]]
   y_m <- regmatches(raw_text, regexec("Y:\\s*([0-9.]+)", raw_text))[[1]]
-
+  
   confidence <- if (length(conf_m) >= 2) toupper(conf_m[2]) else "UNKNOWN"
   found <- length(found_m) >= 2 && toupper(found_m[2]) == "YES"
-
+  
   if (!found || length(x_m) < 2 || length(y_m) < 2) {
     return(list(x = NA_real_, y = NA_real_, confidence = confidence, error = NULL))  # legitimately not found
   }
-
+  
   frac_x <- suppressWarnings(as.numeric(x_m[2]))
   frac_y <- suppressWarnings(as.numeric(y_m[2]))
   if (is.na(frac_x) || is.na(frac_y)) {
     return(list(x = NA_real_, y = NA_real_, confidence = confidence, error = "Couldn't parse coordinates from API response"))
   }
-
+  
   # Convert from the (possibly downscaled) search image's fractional
   # position back to haystack_img's own real pixel coordinates.
   list(x = frac_x * img_w, y = frac_y * img_h, confidence = confidence, error = NULL)
@@ -1162,7 +1574,7 @@ locate_text_via_api <- function(api_key, haystack_img, anchor_text, region_hint 
 fit_point_transform <- function(point_pairs) {
   if (length(point_pairs) < 2) return(NULL)
   if (length(point_pairs) > 4) point_pairs <- point_pairs[1:4]  # perspective wants exactly 4
-
+  
   n <- length(point_pairs)
   fitted <- tryCatch({
     if (n == 2) fit_similarity_transform(point_pairs)
@@ -1170,8 +1582,8 @@ fit_point_transform <- function(point_pairs) {
     else fit_homography_transform(point_pairs)
   }, error = function(e) {
     message(sprintf("fit_point_transform(): fitting failed with %d point(s) — %s. Points are likely too clustered together or nearly collinear for a stable %s fit.",
-                     n, conditionMessage(e),
-                     switch(as.character(n), "2" = "similarity", "3" = "affine", "perspective")))
+                    n, conditionMessage(e),
+                    switch(as.character(n), "2" = "similarity", "3" = "affine", "perspective")))
     NULL
   })
   fitted
@@ -1273,67 +1685,67 @@ fit_homography_transform <- function(pairs) {
 #'     NULL so there's still something to review/correct and retry from.
 #' )
 align_via_reference_points <- function(api_key, submission_img, reference_points,
-                                        template_width, template_height) {
+                                       template_width, template_height) {
   if (is.null(reference_points) || nrow(reference_points) < 2) return(list(transform_fn = NULL, matches = NULL))
-
+  
   match_rows <- vector("list", nrow(reference_points))
   matched_pairs <- list()
-
+  
   for (i in seq_len(nrow(reference_points))) {
     rp <- reference_points[i, ]
     tmpl_x <- (rp$x + rp$w / 2) * template_width
     tmpl_y <- (rp$y + rp$h / 2) * template_height
     region_hint <- describe_region(rp$x + rp$w / 2, rp$y + rp$h / 2)
-
+    
     anchor <- if ("anchor_text" %in% names(rp)) trimws(rp$anchor_text) else ""
     if (!nzchar(anchor)) {
       message(sprintf("Reference point '%s' has no anchor text saved (older template, or left blank) — edit it in Template Designer to set one. Skipping it for now.", rp$name))
       match_rows[[i]] <- data.frame(ref_id = rp$ref_id, name = rp$name, w = rp$w, h = rp$h,
-                                     x = NA_real_, y = NA_real_, score = NA_real_,
-                                     tmpl_x = tmpl_x, tmpl_y = tmpl_y, stringsAsFactors = FALSE)
+                                    x = NA_real_, y = NA_real_, score = NA_real_,
+                                    tmpl_x = tmpl_x, tmpl_y = tmpl_y, stringsAsFactors = FALSE)
       next
     }
-
+    
     loc <- tryCatch(locate_text_via_api(api_key, submission_img, anchor, region_hint = region_hint), error = function(e) {
       list(x = NA_real_, y = NA_real_, confidence = "UNKNOWN", error = conditionMessage(e))
     })
-
+    
     if (!is.null(loc$error)) {
       message(sprintf("Reference point '%s' ('%s') matching failed: %s", rp$name, anchor, loc$error))
     }
     if (is.na(loc$x) || is.na(loc$y)) {
       message(sprintf("Reference point '%s' ('%s') could not be located on this submission (searched %s).", rp$name, anchor, region_hint))
       match_rows[[i]] <- data.frame(ref_id = rp$ref_id, name = rp$name, w = rp$w, h = rp$h,
-                                     x = NA_real_, y = NA_real_, score = NA_real_,
-                                     tmpl_x = tmpl_x, tmpl_y = tmpl_y, stringsAsFactors = FALSE)
+                                    x = NA_real_, y = NA_real_, score = NA_real_,
+                                    tmpl_x = tmpl_x, tmpl_y = tmpl_y, stringsAsFactors = FALSE)
       next
     }
-
+    
     # Pseudo-score derived from self-reported confidence, NOT a true
     # match-quality metric (there's no equivalent of a correlation
     # coefficient here) — kept purely so the existing review-UI
     # coloring (green/orange against EXTRACTION_REF_MIN_SCORE) keeps
     # working without needing its own rework.
     pseudo_score <- if (identical(loc$confidence, "HIGH")) 1.0 else 0.2
-
+    
     match_rows[[i]] <- data.frame(ref_id = rp$ref_id, name = rp$name, w = rp$w, h = rp$h,
-                                   x = loc$x, y = loc$y, score = pseudo_score,
-                                   tmpl_x = tmpl_x, tmpl_y = tmpl_y, stringsAsFactors = FALSE)
+                                  x = loc$x, y = loc$y, score = pseudo_score,
+                                  tmpl_x = tmpl_x, tmpl_y = tmpl_y, stringsAsFactors = FALSE)
     if (pseudo_score < EXTRACTION_REF_MIN_SCORE) {
       message(sprintf("Reference point '%s' ('%s') located with LOW confidence — using it anyway; check it in the Reference Points review view.",
-                       rp$name, anchor))
+                      rp$name, anchor))
     }
     matched_pairs[[length(matched_pairs) + 1]] <- list(sub_x = loc$x, sub_y = loc$y, tmpl_x = tmpl_x, tmpl_y = tmpl_y)
   }
-
+  
   matches_df <- do.call(rbind, match_rows)
-
+  
   if (length(matched_pairs) < 2) {
     message(sprintf("Only %d of %d reference point(s) could be located at all — need at least 2 to align; falling back.",
-                     length(matched_pairs), nrow(reference_points)))
+                    length(matched_pairs), nrow(reference_points)))
     return(list(transform_fn = NULL, matches = matches_df))
   }
-
+  
   list(transform_fn = fit_point_transform(matched_pairs), matches = matches_df)
 }
 
@@ -1374,12 +1786,57 @@ align_submission <- function(api_key, img, template, template_border) {
 #' marker placed correctly in preview could land wrong at extraction
 #' time if the two code paths ever drifted apart.
 #'
+#' Expand an uploaded-files data.frame (Shiny fileInput's $name/$datapath
+#' columns) into one row per SUBMISSION rather than one row per
+#' uploaded FILE — a multi-page PDF is N submissions bundled into one
+#' upload (a facility scanning several completed tally sheets into a
+#' single file is a real, observed pattern, not a hypothetical), and
+#' extraction should treat each page as its own submission rather than
+#' silently reading page 1 and dropping the rest. Non-PDF files and
+#' single-page PDFs just pass through as one row each.
+#'
+#' @param files data.frame with at least $name, $datapath (i.e.
+#'   input$submission_upload as Shiny provides it)
+#' @return data.frame(fname, fpath, page, page_count, display_name) —
+#'   one row per submission. display_name is what should be shown/
+#'   stored as source_file: the plain filename when page_count == 1,
+#'   or "<filename> (page P of N)" when it's one page of a multi-page
+#'   PDF, so results from the same file are still recognizably grouped
+#'   together in the results table/CSV while remaining distinguishable.
+expand_submission_uploads <- function(files) {
+  rows <- lapply(seq_len(nrow(files)), function(i) {
+    fname <- files$name[i]
+    fpath <- files$datapath[i]
+    ext <- tolower(fs::path_ext(fname))
+    n_pages <- if (identical(ext, "pdf")) get_pdf_page_count(fpath) else 1L
+    
+    data.frame(
+      fname = fname, fpath = fpath,
+      page = seq_len(n_pages), page_count = n_pages,
+      display_name = if (n_pages > 1) {
+        sprintf("%s (page %d of %d)", fname, seq_len(n_pages), n_pages)
+      } else {
+        fname
+      },
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+#' @param page Which PDF page to convert (ignored for non-PDF files).
+#'   Defaults to 1 for backward compatibility with any caller that
+#'   doesn't care about multi-page PDFs; mod_extraction.R's extraction
+#'   loop always passes an explicit page number now — see
+#'   expand_submission_uploads() there, which turns an N-page PDF
+#'   upload into N separate submissions (one per page) rather than
+#'   silently extracting only page 1 and dropping the rest.
 #' @return magick image, or NULL if reading/converting the file failed
-prep_submission_image <- function(fpath, fname) {
+prep_submission_image <- function(fpath, fname, page = 1) {
   ext <- tolower(fs::path_ext(fname))
   src_path <- fpath
   if (ext == "pdf") {
-    converted <- tryCatch(convert_pdf_page_to_image(fpath, page = 1), error = function(e) NULL)
+    converted <- tryCatch(convert_pdf_page_to_image(fpath, page = page), error = function(e) NULL)
     if (is.null(converted)) return(NULL)
     src_path <- converted$path
   }
@@ -1426,12 +1883,12 @@ prep_submission_image <- function(fpath, fname) {
 #'   align_method = "reference_points" | "border" | "resize"
 #' )
 extract_submission <- function(api_key, submission_img_path, template,
-                                template_border = NULL, on_field = NULL) {
+                               template_border = NULL, on_field = NULL) {
   img <- magick::image_read(submission_img_path)  # ORIGINAL — never modified below
-
+  
   image_path <- tempfile(fileext = ".png")
   magick::image_write(img, image_path, format = "png")
-
+  
   align_result <- align_submission(api_key, img, template, template_border)
   transform_fn <- align_result$transform_fn
   if (is.null(transform_fn)) {
@@ -1442,19 +1899,19 @@ extract_submission <- function(api_key, submission_img_path, template,
     message("align_submission() unexpectedly returned no transform — using plain scale as a last-resort safety net.")
     transform_fn <- fit_plain_scale_transform(img, template$image_width, template$image_height)
   }
-
+  
   fields <- as.data.frame(template$fields, stringsAsFactors = FALSE)
   n_fields <- nrow(fields)
   results <- vector("list", n_fields)
-
+  
   for (i in seq_len(n_fields)) {
     field <- as.list(fields[i, ])
     if (!is.null(on_field)) on_field(i, n_fields, field$name)
-
+    
     crop_info <- crop_field_image(img, field, transform_fn, template$image_width, template$image_height)
     res <- extract_field_value(api_key, crop_info$path, field)
     unlink(crop_info$path)
-
+    
     results[[i]] <- data.frame(
       field_name = field$name, field_type = field$type,
       x = field$x, y = field$y, w = field$w, h = field$h,
@@ -1464,7 +1921,7 @@ extract_submission <- function(api_key, submission_img_path, template,
       stringsAsFactors = FALSE
     )
   }
-
+  
   list(results = do.call(rbind, results), image_path = image_path,
        prewarp_image_path = image_path, ref_matches = align_result$matches,
        align_method = align_result$method)
@@ -1494,29 +1951,29 @@ extract_submission <- function(api_key, submission_img_path, template,
 #'   align_method "reference_points_corrected"
 reextract_submission_with_points <- function(api_key, prewarp_image_path, template, points, on_field = NULL) {
   img <- magick::image_read(prewarp_image_path)  # ORIGINAL — never modified
-
+  
   usable <- points[!is.na(points$x) & !is.na(points$y), , drop = FALSE]
   point_pairs <- lapply(seq_len(nrow(usable)), function(i) {
     list(sub_x = usable$x[i], sub_y = usable$y[i], tmpl_x = usable$tmpl_x[i], tmpl_y = usable$tmpl_y[i])
   })
-
+  
   transform_fn <- fit_point_transform(point_pairs)
   if (is.null(transform_fn)) {
     stop("Re-alignment failed — either fewer than 2 usable point positions, or the point set was rejected as degenerate (too clustered together or nearly collinear — see console for details from fit_point_transform()). Adjust the points and try again.")
   }
-
+  
   fields <- as.data.frame(template$fields, stringsAsFactors = FALSE)
   n_fields <- nrow(fields)
   results <- vector("list", n_fields)
-
+  
   for (i in seq_len(n_fields)) {
     field <- as.list(fields[i, ])
     if (!is.null(on_field)) on_field(i, n_fields, field$name)
-
+    
     crop_info <- crop_field_image(img, field, transform_fn, template$image_width, template$image_height)
     res <- extract_field_value(api_key, crop_info$path, field)
     unlink(crop_info$path)
-
+    
     results[[i]] <- data.frame(
       field_name = field$name, field_type = field$type,
       x = field$x, y = field$y, w = field$w, h = field$h,
@@ -1526,7 +1983,7 @@ reextract_submission_with_points <- function(api_key, prewarp_image_path, templa
       stringsAsFactors = FALSE
     )
   }
-
+  
   list(results = do.call(rbind, results), image_path = prewarp_image_path,
        prewarp_image_path = prewarp_image_path,
        ref_matches = points, align_method = "reference_points_corrected")

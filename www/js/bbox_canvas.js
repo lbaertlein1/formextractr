@@ -251,11 +251,12 @@ window.formExtractR = window.formExtractR || {};
         x: b.x * canvas.width, y: b.y * canvas.height,
         w: b.w * canvas.width, h: b.h * canvas.height
       };
-      // Reference points (alignment anchors) render green, distinct
-      // from fields' orange — same selection/resize interaction for
-      // both, this is purely so it's obvious at a glance which is which.
-      const color = b.kind === "reference" ? "#1a8a3f" : "#e0770f";
-      drawRect(canvasId, r.x, r.y, r.w, r.h, color, b.label, isSelected);
+      // Every box drawn in the Template Designer is a field now — the
+      // reference-point (alignment anchor) kind that used to render
+      // green here was removed along with the rest of the alignment
+      // pipeline (extraction reads each whole submission in one call
+      // instead of cropping via a geometric transform).
+      drawRect(canvasId, r.x, r.y, r.w, r.h, "#e0770f", b.label, isSelected);
     });
   }
 

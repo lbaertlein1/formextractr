@@ -30,7 +30,7 @@
   font-size: 12px;
 }
 
-/* Extraction results: low-confidence cell flag */
+/* Extraction results: low-confidence cell flag (results table) */
 .fe-low-conf {
   background: #fff3cd;
   border: 1px solid #ffe08a;
@@ -90,25 +90,6 @@
   align-self: flex-start;
 }
 
-.fe-overlay-wrap {
-  position: relative;
-  display: block;
-  line-height: 0; /* prevents the inline-image baseline gap from throwing off overlay alignment */
-}
-
-.fe-overlay-box {
-  position: absolute;
-  border: 2px solid #2b8aef;
-  background: rgba(43, 138, 239, 0.10);
-  border-radius: 2px;
-  pointer-events: none; /* clicks pass through to the image; this is a visual reference only, not interactive */
-}
-
-.fe-overlay-box-low {
-  border-color: #e0a600;
-  background: rgba(224, 166, 0, 0.18);
-}
-
 .fe-review-fields-pane {
   flex: 1;
   max-height: 78vh;
@@ -133,77 +114,4 @@
 
 .modal-lg .modal-body {
   max-height: 78vh;
-}
-
-/* Currently-focused field's box on the review image — red overrides
-   both the default blue and the low-confidence orange while active. */
-.fe-overlay-box-active {
-  border-color: #d32f2f !important;
-  border-width: 3px !important;
-  background: rgba(211, 47, 47, 0.20) !important;
-  box-shadow: 0 0 0 2px rgba(211, 47, 47, 0.35);
-  z-index: 5;
-}
-
-/* Reference Points view: draggable markers on the pre-warp submission
-   image, sized to match the actual reference point box (left/top/
-   width/height set inline per-marker in R, as % of the image) — NOT a
-   fixed size, so a marker actually reflects how big a region you
-   drew, rather than always rendering as a small generic dot regardless
-   of that. Green = matched with good confidence or manually corrected,
-   orange = low confidence, red = failed to match at all (position is a
-   fallback/center-of-page guess, needs a manual drag). The center dot
-   (::after) marks the exact point that gets sent on drag/drop; the box
-   itself is the grabbable area and the visual size reference. */
-.fe-refpoint-marker {
-  position: absolute;
-  min-width: 16px;
-  min-height: 16px;
-  border: 2px solid currentColor;
-  background: rgba(0, 0, 0, 0.06);
-  box-sizing: border-box;
-  cursor: grab;
-  z-index: 6;
-}
-
-.fe-refpoint-marker::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 10px;
-  height: 10px;
-  margin-left: -5px;
-  margin-top: -5px;
-  border-radius: 50%;
-  border: 2px solid #ffffff;
-  box-shadow: 0 0 0 1.5px currentColor;
-}
-
-.fe-refpoint-marker.fe-refpoint-good    { color: #1a8a3f; }
-.fe-refpoint-marker.fe-refpoint-low     { color: #e0a600; }
-.fe-refpoint-marker.fe-refpoint-missing { color: #d32f2f; }
-
-.fe-refpoint-dragging {
-  cursor: grabbing;
-}
-.fe-refpoint-dragging::after {
-  box-shadow: 0 0 0 2.5px currentColor, 0 0 6px rgba(0,0,0,0.4);
-}
-
-.fe-refpoint-label {
-  position: absolute;
-  left: 16px;
-  top: -4px;
-  background: rgba(255,255,255,0.92);
-  border: 1px solid currentColor;
-  border-radius: 3px;
-  padding: 1px 5px;
-  font-size: 11px;
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-.fe-refpoint-toggle {
-  margin-bottom: 8px;
 }

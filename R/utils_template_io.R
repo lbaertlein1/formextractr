@@ -19,16 +19,14 @@
 #   "image_height":  <int px>,
 #   "is_filled_reference": <bool — TRUE if annotated from a completed
 #       form because no blank was available>,
-#   "reference_points": [
-#     { "ref_id": "<uuid>", "name": "<string>", "x":<0-1>,"y":<0-1>,"w":<0-1>,"h":<0-1>,
-#       "anchor_text": "<the exact text printed at this location, used to locate this
-#         point on a submission at extraction time via a Claude API call — see
-#         locate_text_via_api() in utils_extraction.R. Auto-filled by reading the
-#         patch when the box is drawn in Template Designer, always user-editable.
-#         Empty string for reference points created before this field existed;
-#         those get skipped at extraction time with a message asking to fill it in.>" },
-#     ...
-#   ],
+#   "reference_points": [ ... ] — LEGACY, always empty now. Used to hold
+#       alignment anchors for the old per-field-crop extraction pipeline
+#       (see utils_extraction.R's module header for why that pipeline
+#       was replaced). save_template() still accepts/defaults this
+#       parameter and load_template() still returns whatever's in an
+#       older file's JSON, purely so pre-existing template files keep
+#       loading without erroring — nothing in the running app writes a
+#       non-empty value here or reads this key anymore.
 #   "fields": [
 #     {
 #       "field_id": "<uuid>", "name": "<string>", "type": "<FIELD_TYPES value>",
@@ -44,16 +42,16 @@ library(fs)
 
 #' Save a template (creates new or overwrites existing by template_id)
 save_template <- function(template_id = NULL, template_name,
-                           image_file, image_width, image_height,
-                           is_filled_reference = FALSE, reference_points = NULL, fields) {
+                          image_file, image_width, image_height,
+                          is_filled_reference = FALSE, reference_points = NULL, fields) {
   fs::dir_create(TEMPLATE_DIR)
-
+  
   is_new <- is.null(template_id)
   if (is_new) template_id <- uuid::UUIDgenerate()
-
+  
   now <- format(Sys.time(), "%Y-%m-%dT%H:%M:%OS0Z", tz = "UTC")
   existing <- if (!is_new) tryCatch(load_template(template_id), error = function(e) NULL) else NULL
-
+  
   template <- list(
     template_id          = template_id,
     template_name        = template_name,
@@ -66,10 +64,10 @@ save_template <- function(template_id = NULL, template_name,
     reference_points     = if (is.null(reference_points)) list() else reference_points,
     fields               = fields
   )
-
+  
   out_path <- fs::path(TEMPLATE_DIR, paste0(template_id, ".json"))
   jsonlite::write_json(template, out_path, auto_unbox = TRUE, pretty = TRUE)
-
+  
   template_id
 }
 
@@ -86,7 +84,7 @@ load_template <- function(template_id) {
 list_templates <- function() {
   fs::dir_create(TEMPLATE_DIR)
   files <- fs::dir_ls(TEMPLATE_DIR, glob = "*.json")
-
+  
   if (length(files) == 0) {
     return(data.frame(
       template_id = character(), template_name = character(),
@@ -94,7 +92,7 @@ list_templates <- function() {
       stringsAsFactors = FALSE
     ))
   }
-
+  
   rows <- lapply(files, function(f) {
     t <- jsonlite::read_json(f, simplifyVector = TRUE)
     n_fields <- if (is.null(t$fields)) 0 else NROW(t$fields)
@@ -106,7 +104,7 @@ list_templates <- function() {
       stringsAsFactors = FALSE
     )
   })
-
+  
   out <- do.call(rbind, rows)
   out[order(out$updated_at, decreasing = TRUE), ]
 }

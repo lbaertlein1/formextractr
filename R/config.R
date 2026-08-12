@@ -5,13 +5,23 @@
 # the template designer writes, with no risk of drift.
 
 # Supported field data types for template annotation.
-# Each type will map to a distinct extraction prompt/strategy in the
-# extraction engine module (not yet built).
+# Each type maps to a distinct extraction prompt in build_field_instructions()
+# (utils_extraction.R). numeric_handwritten and numeric_printed are split
+# the same way text_handwritten/text_printed already were — a numeric
+# field needs the same disambiguation for exactly the same reason text
+# did: on a form like an EPI tally sheet, cells are pre-printed with
+# placeholder digits (e.g. "00000") that a naive "read the number here"
+# instruction can't tell apart from actual respondent-entered data. Most
+# fields on this app's typical forms (tally totals, counts) should be
+# numeric_handwritten; numeric_printed is for the rarer case of an
+# actual printed number you want read as data (a form/serial number, a
+# printed reference code, etc.) rather than one to be filled in.
 FIELD_TYPES <- c(
   "text_printed",
   "text_handwritten",
   "date_handwritten",
-  "numeric",
+  "numeric_handwritten",
+  "numeric_printed",
   "checkbox",
   "circled_text",
   "tally_count"
@@ -19,13 +29,14 @@ FIELD_TYPES <- c(
 
 # Human-readable labels for the UI dropdown (names = internal value)
 FIELD_TYPE_LABELS <- c(
-  "text_printed"      = "Printed text",
-  "text_handwritten"  = "Handwritten text",
-  "date_handwritten"  = "Handwritten date",
-  "numeric"           = "Numeric",
-  "checkbox"          = "Checkbox (filled/unfilled)",
-  "circled_text"      = "Circled text (one of several options)",
-  "tally_count"       = "Tally / hash marks (count)"
+  "text_printed"         = "Printed text",
+  "text_handwritten"     = "Handwritten text",
+  "date_handwritten"     = "Handwritten date",
+  "numeric_handwritten"  = "Numeric (handwritten)",
+  "numeric_printed"      = "Numeric (printed)",
+  "checkbox"             = "Checkbox (filled/unfilled)",
+  "circled_text"         = "Circled text (one of several options)",
+  "tally_count"          = "Tally / hash marks (count)"
 )
 
 # Field types that carry an extra `options` list (the set of printed
@@ -86,6 +97,48 @@ EXTRACTION_MIN_CROP_DIM <- 150
 # fit_border_transform() in utils_extraction.R) — nothing corrects skew
 # independently of those.
 
+# ---- Holistic extraction (whole-submission, single call) --------------
+# One call per submission: the whole image + every field's instructions,
+# asking for one structured JSON response. See extract_submission_holistic()
+# in utils_extraction.R. Max long-edge dimension sent to the API — the
+# API downscales internally to a model-dependent limit regardless
+# (~1568px on most current models; higher on Opus 4.7+/Mythos-tier), so
+# this mostly controls payload size/cost rather than what the model
+# ultimately sees. If a dense form's small handwriting turns out to need
+# more resolution than a single downscaled image preserves, the fix is a
+# fixed, non-adaptive tweak here (e.g. split into a top-half/bottom-half
+# pair sent as two images in the same call) — not something to solve by
+# raising this number past what the API honors anyway.
+EXTRACTION_HOLISTIC_MAX_DIM <- 1568
+
+# Max output tokens for extract_submission_holistic()'s single call.
+# Deliberately generous, not sized to the JSON response alone: Claude
+# Sonnet 5 (EXTRACTION_MODEL) runs adaptive thinking BY DEFAULT, and
+# thinking tokens count against max_tokens for the turn — a budget
+# sized just for "a few hundred tokens of JSON per field" can be
+# entirely consumed by thinking before the model finishes writing the
+# actual response, producing an empty or truncated (unparseable) reply.
+# Confirmed via Anthropic's own guidance: a tight budget on Sonnet 5
+# can produce "a response that is almost entirely thinking followed by
+# a truncated answer and stop_reason: 'max_tokens'". Raising this is
+# the fix, not tightening prompt wording — see the explicit stop_reason
+# check in extract_submission_holistic() for how a truncation like that
+# now gets diagnosed clearly instead of surfacing as a generic JSON
+# parse failure.
+EXTRACTION_HOLISTIC_MAX_TOKENS <- 16000
+
+# ---- Legacy: per-field crop + reference-point alignment ----------------
+# The functions below (extract_submission(), align_submission(),
+# fit_point_transform(), detect_page_border(), crop_field_image(),
+# locate_reference_points_*(), reextract_submission_with_points()) are
+# NOT called anywhere in mod_extraction.R anymore — extraction now goes
+# through extract_submission_holistic() exclusively (one call per
+# submission, whole image, no alignment step). Left in place rather than
+# deleted in case anything about the coordinate-transform machinery is
+# still wanted later, but nothing in the running app currently exercises
+# this code path. Safe to delete once the holistic approach is validated
+# against a real batch.
+#
 # Border-alignment (reference-point) detection. Most tally-sheet-style
 # forms have a strong printed black rectangle framing the whole table —
 # this constant controls how that border gets detected so a
@@ -124,8 +177,8 @@ EXTRACTION_BORDER_BRIGHTNESS_MAX <- 200
 # image-patch matching wasn't.
 EXTRACTION_REF_MIN_SCORE <- 0.5  # threshold on the confidence-derived pseudo-score below — see locate_text_via_api()
 EXTRACTION_REF_API_MAX_DIM <- 1568  # px — submission is downscaled to at most this on its longer side before
-                                     # the locate-text API call; controls cost/latency without hurting precision,
-                                     # since the result is a resolution-independent fraction of the image either way
+# the locate-text API call; controls cost/latency without hurting precision,
+# since the result is a resolution-independent fraction of the image either way
 
 # Grid overlay for locate_reference_points_holistic()'s "Auto-suggest
 # via AI" — asking a vision model for a precise continuous fraction
